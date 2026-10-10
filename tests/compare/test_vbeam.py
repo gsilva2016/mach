@@ -18,14 +18,6 @@ from pyuff_ustb import ChannelData, Scan
 pytest.importorskip("vbeam")
 pytest.importorskip("jax")
 
-try:
-    import cupy as cp
-
-    HAS_CUPY = True
-except ImportError:
-    HAS_CUPY = False
-    cp = None
-
 import jax
 import jax.numpy as jnp
 from spekk import Spec
@@ -37,9 +29,28 @@ from vbeam.interpolation import FastInterpLinspace
 from vbeam.scan import LinearScan
 from vbeam.wavefront import PlaneWavefront, ReflectedWavefront
 
-from mach import experimental, kernel
+from mach import _backend, experimental, kernel
 from mach._vis import save_debug_figures
 from mach.io.uff import create_beamforming_setup, create_single_transmit_beamforming_setup
+
+# Device arrays come from whichever library matches the active backend: CuPy
+# under CUDA, dpnp under SYCL.
+DEVICE_XP = _backend.device_namespace()
+HAS_DEVICE_XP = DEVICE_XP is not None
+
+
+def jax_accelerator(platform: str):
+    """First jax device on `platform`, skipping the test if jax does not have that platform.
+
+    `jax.devices()` raises rather than returning an empty list for a platform it was not
+    built with, so a jax[cpu] install would otherwise turn these into collection errors.
+    """
+    try:
+        devices = jax.devices(platform)
+    except RuntimeError:
+        pytest.skip(f"jax has no '{platform}' devices, its default backend is '{jax.default_backend()}'")
+    return devices[0]
+
 
 # ============================================================================
 # Fixtures
@@ -66,12 +77,13 @@ def iq_data(pymust_data, pymust_params):
 
 @pytest.fixture(
     scope="session",
-    # Note: pytest-benchmark interferes with jax[cpu], so we only test on GPU
+    # Note: pytest-benchmark interferes with jax[cpu], so we only test on GPU.
+    # "gpu" covers Intel too: jax aliases it to whichever of cuda/rocm/oneapi is present.
     params=["gpu"],
 )
 def vbeam_pymust_setup(request, iq_data, pymust_element_positions, pymust_grid, pymust_params) -> SignalForPointSetup:
     """Convert PyMUST data to vbeam SignalForPointSetup."""
-    device = jax.devices(request.param)[0]
+    device = jax_accelerator(request.param)
     params = pymust_params
     x_range, y_range, z_range = pymust_grid
 
@@ -185,7 +197,7 @@ def mach_beamform_kwargs(
     return create_beamforming_setup(
         channel_data=picmus_phantom_resolution_channel_data,
         scan=picmus_phantom_resolution_scan,
-        xp=cp if HAS_CUPY else np,
+        xp=DEVICE_XP if HAS_DEVICE_XP else np,
     )
 
 
@@ -215,7 +227,7 @@ def mach_single_transmit_kwargs(
         channel_data=picmus_phantom_resolution_channel_data,
         scan=picmus_phantom_resolution_scan,
         wave_index=transmit_idx,
-        xp=cp if HAS_CUPY else np,
+        xp=DEVICE_XP if HAS_DEVICE_XP else np,
     )
 
 
@@ -290,7 +302,7 @@ def test_vbeam_benchmark(benchmark, vbeam_pymust_setup, output_dir):
         print("Saved debug figures to", output_dir)
 
 
-@pytest.mark.skipif(not HAS_CUPY, reason="CuPy not available")
+@pytest.mark.skipif(not HAS_DEVICE_XP, reason="no device-array library for the active mach backend")
 @pytest.mark.filterwarnings("ignore:array is not contiguous, rearranging will add latency:UserWarning")
 def test_mach_matches_vbeam_single_transmit(
     mach_single_transmit_kwargs: dict,
@@ -303,7 +315,7 @@ def test_mach_matches_vbeam_single_transmit(
 
     # Run mach single-transmit beamforming using kernel.beamform directly
     gpu_result = kernel.beamform(**mach_single_transmit_kwargs, tukey_alpha=0.0)
-    result = cp.asnumpy(gpu_result)
+    result = DEVICE_XP.asnumpy(gpu_result)
     # Reshape to (x, z)
     result = result.reshape(grid_shape)
 
@@ -344,7 +356,7 @@ def test_mach_matches_vbeam_single_transmit(
     )
 
 
-@pytest.mark.skipif(not HAS_CUPY, reason="CuPy not available")
+@pytest.mark.skipif(not HAS_DEVICE_XP, reason="no device-array library for the active mach backend")
 @pytest.mark.filterwarnings("ignore:array is not contiguous, rearranging will add latency:UserWarning")
 def test_mach_matches_vbeam(mach_beamform_kwargs, vbeam_setup_uff: SignalForPointSetup, output_dir):
     """Validate mach against vbeam output on a PICMUS UFF data file."""
@@ -352,7 +364,7 @@ def test_mach_matches_vbeam(mach_beamform_kwargs, vbeam_setup_uff: SignalForPoin
 
     # Match our custom vbeam apodization settings
     gpu_result = experimental.beamform(**mach_beamform_kwargs, tukey_alpha=0.0)
-    result = cp.asnumpy(gpu_result)
+    result = DEVICE_XP.asnumpy(gpu_result)
     # Reshape to (x, z)
     result = result.reshape(grid_shape)
 

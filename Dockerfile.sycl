@@ -1,0 +1,147 @@
+# syntax=docker/dockerfile:1
+
+# Development environment for mach-beamform's SYCL backend
+# Provides Intel oneAPI DPC++ compilation without requiring a local oneAPI installation
+#
+#   docker build -f Dockerfile.sycl --build-arg DEVICE=gpu -t mach-beamform-sycl:gpu .
+#   docker build -f Dockerfile.sycl --build-arg DEVICE=cpu -t mach-beamform-sycl:cpu .
+#
+# The compiled extension is identical either way. MACH_SYCL_TARGETS defaults to
+# spir64, which JITs for whichever device is present, so the two images differ
+# only in whether the Intel GPU driver stack is installed. Pick cpu when you have
+# no Intel GPU: it is a much smaller image and still runs the whole test suite.
+
+ARG UBUNTU_VERSION=24.04
+# cpu or gpu — selects which device-* stage the final image is built from
+ARG DEVICE=gpu
+
+# ---------------------------------------------------------------------------
+# Base: build tooling and uv
+# ---------------------------------------------------------------------------
+FROM ubuntu:${UBUNTU_VERSION} AS base
+
+# Avoid interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# The Makefile is written for bash, and setvars.sh has to be sourced
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    cmake \
+    curl \
+    git \
+    gnupg \
+    make \
+    ninja-build \
+    ocl-icd-libopencl1 \
+    software-properties-common \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install uv (will automatically install Python when needed)
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+# Silence warning about not being able to use hard links with cache mount
+ENV UV_LINK_MODE=copy
+
+# ---------------------------------------------------------------------------
+# Intel oneAPI DPC++
+# ---------------------------------------------------------------------------
+# Installed from Intel's APT repo rather than the offline installer: the
+# installer is several GB of base toolkit, and mach only needs the DPC++
+# compiler. 2026 is the floor enforced by MACH_SYCL_MIN_VERSION in
+# CMakeLists.txt, because dpnp's wheels bundle the 2026 SYCL runtime and mach
+# passes a sycl::queue pointer across that boundary.
+FROM base AS oneapi
+
+ARG ONEAPI_VERSION=2026.1
+
+RUN wget -qO- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
+    | gpg --dearmor -o /usr/share/keyrings/oneapi-archive-keyring.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" \
+    > /etc/apt/sources.list.d/oneAPI.list \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    intel-oneapi-compiler-dpcpp-cpp-${ONEAPI_VERSION} \
+    intel-oneapi-runtime-opencl \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# Device stages: the only difference between the cpu and gpu images
+# ---------------------------------------------------------------------------
+# The OpenCL CPU device came with intel-oneapi-runtime-opencl above, so there
+# is nothing further to install for CPU-only use.
+FROM oneapi AS device-cpu
+
+# Intel GPU user-space drivers: Level Zero for the SYCL GPU backend, and the
+# OpenCL ICD alongside it. The kobuk-team PPA is Intel's channel for Ubuntu
+# 24.04 and newer; the container still needs /dev/dri passed in at run time.
+FROM oneapi AS device-gpu
+
+RUN add-apt-repository -y ppa:kobuk-team/intel-graphics \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    clinfo \
+    intel-gsc \
+    intel-metrics-discovery \
+    intel-opencl-icd \
+    libze-intel-gpu1 \
+    libze1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# Build mach against the SYCL backend
+# ---------------------------------------------------------------------------
+FROM device-${DEVICE} AS dev
+
+# Re-declared because ARGs from before the first FROM are not in scope here
+ARG DEVICE
+# Set to 0 to skip dpctl and dpnp, which pull the oneAPI runtime wheels
+ARG INSTALL_SYCL_ARRAY=1
+
+WORKDIR /workspace
+
+# Copy dependency files first for better layer caching
+# Dependencies only rebuild when these files change
+COPY pyproject.toml uv.lock .python-version ./
+
+# Warm the dependency layer so source changes do not reinstall the world.
+# --inexact matches the Makefile: a plain sync would prune dpctl and dpnp.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --inexact --group build --no-install-project
+
+# Copy the rest of the project
+# Source code changes won't trigger dependency reinstall
+COPY . .
+
+# Build through the Makefile so the image exercises the same path as a local
+# build, including the icpx version check in check-system-dep-sycl
+RUN --mount=type=cache,target=/root/.cache/uv \
+    source /opt/intel/oneapi/setvars.sh --force > /dev/null \
+    && make compile-sycl
+
+# Installed directly rather than via `make install-sycl-array`, whose
+# verification step needs a device that is not present during a build
+RUN --mount=type=cache,target=/root/.cache/uv \
+    if [ "${INSTALL_SYCL_ARRAY}" = "1" ]; then uv pip install --group sycl-array; fi
+
+# Add virtual environment to PATH so Python and installed packages are available
+ENV PATH="/workspace/.venv/bin:${PATH}"
+
+# Select the SYCL backend and match the device to the image variant
+ENV MACH_BACKEND=sycl
+ENV MACH_SYCL_DEVICE=${DEVICE}
+
+# OCI labels
+LABEL org.opencontainers.image.title="mach-beamform-sycl" \
+      org.opencontainers.image.description="Intel oneAPI DPC++ development environment for ultrafast beamforming" \
+      org.opencontainers.image.source="https://github.com/Forest-Neurotech/mach" \
+      org.opencontainers.image.vendor="Forest Neurotech"
+
+# setvars.sh exports a dozen variables and has to be sourced, which a plain
+# ENTRYPOINT-less image cannot do for `docker run <image> make test-sycl`.
+# Inline rather than a shell script, because a heredoc would carry the CRLF
+# line endings of a Windows checkout into the shebang.
+ENTRYPOINT ["/bin/bash", "-c", "source /opt/intel/oneapi/setvars.sh --force > /dev/null && exec \"$@\"", "oneapi-entrypoint"]
+
+# Default command: interactive bash shell
+CMD ["/bin/bash"]

@@ -1,23 +1,13 @@
 """The specific function arguments / names (API) are experimental and may change."""
 
-from enum import Enum
 from typing import cast
 
 from jaxtyping import Num, Real
 
-from mach import kernel
-from mach._array_api import Array, array_namespace
+from mach import _backend, kernel
+from mach._array_api import Array, DLPackDevice, array_namespace
 
-
-class DLPackDevice(int, Enum):
-    """Enum for the different DLPack device types.
-
-    Port of:
-    https://github.com/dmlc/dlpack/blob/main/include/dlpack/dlpack.h#L76-L80
-    """
-
-    CPU = 1
-    CUDA = 2
+__all__ = ["DLPackDevice", "beamform"]
 
 
 def beamform(
@@ -62,31 +52,14 @@ def beamform(
         if out.dtype != expected_dtype:
             raise ValueError(f"Output array dtype {out.dtype} doesn't match expected {expected_dtype}")
 
-    # TODO: clean this up
-    # Because we accumulate, we need to ensure the output array is on the GPU
-    # so it accumulates in place
-    out_orig = out
-    if out_orig.__dlpack_device__()[0] != DLPackDevice.CUDA:
-        try:
-            import cupy as cp
-        except ImportError as err:
-            raise ImportError(
-                "cupy is currently required to allocate a GPU-compounding output array. Install with: pip install cupy-cuda12x"
-            ) from err
-
-        out = cp.zeros_like(out_orig)
-
-    # Compounding is: simply summing the beamform data into the same output array
-    for transmit_idx in range(n_transmits):
-        # Extract single-transmit data
-        single_channel_data = channel_data[transmit_idx]
-
-        # Call single-transmit beamform
-        _ = kernel.beamform(
-            single_channel_data,
+    # Backends with a whole-sequence entry point compound the transmits without
+    # returning to Python or to host memory in between.
+    if kernel.SUPPORTS_COMPOUND:
+        return kernel.beamform_compound(
+            channel_data,
             rx_coords_m,
             scan_coords_m,
-            tx_wave_arrivals_s[transmit_idx],
+            tx_wave_arrivals_s,
             out=out,
             rx_start_s=rx_start_s,
             sampling_freq_hz=sampling_freq_hz,
@@ -96,13 +69,53 @@ def beamform(
             tukey_alpha=tukey_alpha,
         )
 
+    # TODO: clean this up
+    # The kernel accumulates into an output array that is already on the device, so
+    # an output array that is not gets replaced by a device-side or host-side accumulator.
+    out_orig = out
+    on_device = out_orig.__dlpack_device__()[0] == _backend.BACKEND_DEVICE
+    accumulate_on_host = False
+    device_xp = None
+    if not on_device:
+        device_xp = _backend.device_namespace()
+        if device_xp is not None:
+            out = device_xp.zeros((n_points, n_frames), dtype=output_dtype)
+        else:
+            # Without a device-array library, beamform each transmit into its own
+            # array and sum those on the host.
+            accumulate_on_host = True
+            out = xp_data.zeros((n_points, n_frames), dtype=output_dtype)
+
+    # Compounding is: simply summing the beamform data across transmits
+    for transmit_idx in range(n_transmits):
+        # Extract single-transmit data
+        single_channel_data = channel_data[transmit_idx]
+
+        # Call single-transmit beamform
+        transmit_out = kernel.beamform(
+            single_channel_data,
+            rx_coords_m,
+            scan_coords_m,
+            tx_wave_arrivals_s[transmit_idx],
+            out=None if accumulate_on_host else out,
+            rx_start_s=rx_start_s,
+            sampling_freq_hz=sampling_freq_hz,
+            f_number=f_number,
+            sound_speed_m_s=sound_speed_m_s,
+            modulation_freq_hz=modulation_freq_hz,
+            tukey_alpha=tukey_alpha,
+        )
+        if accumulate_on_host:
+            out = out + transmit_out
+
     # Move the data back to the dedicated output array
-    if out_orig.__dlpack_device__()[0] != DLPackDevice.CUDA:
-        import cupy as cp
+    if not on_device:
+        if not accumulate_on_host:
+            assert device_xp is not None, "expected a device-array library for the device accumulator"
+            # cupy and dpnp both spell host transfer the same way
+            out = device_xp.asnumpy(out)
 
-        assert isinstance(out, cp.ndarray), "expected allocated output array to be a cupy array"
-
-        out_orig[:] = out.get()
+        out_orig[:] = out
         return out_orig
 
     return cast(Array, out)

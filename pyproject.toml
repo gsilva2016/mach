@@ -98,6 +98,19 @@ array = [
     "cupy-cuda12x>=14.0.0",
     "jax[cuda12]>=0.7.1",
 ]
+# Device arrays for the SYCL backend, the Intel counterpart to the `array` group.
+# Keep these out of `array`: they pull the oneAPI runtime, and a CUDA box has no use for them.
+# dpctl 0.22 removed `dpctl.tensor` and moved tensor functionality into dpnp, so
+# dpnp is the array library and dpctl is only the device/queue layer underneath it.
+# dpcpp-cpp-rt is pinned to the same oneAPI release that mach must be compiled with
+# (see MACH_SYCL_MIN_VERSION in CMakeLists.txt): mach passes a sycl::queue pointer
+# to dpctl, which is only valid if both sides are the same SYCL runtime.
+sycl-array = [
+    "numpy>=2.0.2",
+    "dpctl>=0.22.0",
+    "dpnp>=0.20.0",
+    "dpcpp-cpp-rt>=2026.0,<2027.0a0",
+]
 # Compare with other beamforming libraries
 compare = [
     "pymust>=0.1.8",
@@ -205,6 +218,7 @@ ignore = [
 "test_*.py" = ["S101"]
 "tests/*" = ["S101", "RUF001", "RUF003"]
 "src/mach/_cuda_impl.pyi" = ["C408"]  # nanobind.stubgen uses dict()
+"src/mach/_sycl_impl.pyi" = ["C408"]  # nanobind.stubgen uses dict()
 
 [tool.ruff.format]
 preview = true

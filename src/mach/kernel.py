@@ -1,22 +1,49 @@
-"""Python bindings and wrapper for the CUDA kernel."""
+"""Python bindings and wrapper for the compiled CUDA/SYCL kernel."""
 
-from typing import cast
+from typing import Any, cast
 
 from array_api_compat import is_writeable_array
 from jaxtyping import Num, Real
 
+# _backend resolves to the nanobind module of whichever backend was compiled
+from mach import _backend
 from mach._array_api import Array, array_namespace
+from mach._backend import InterpolationType
+from mach._backend import beamform as nb_beamform
 from mach._check import ensure_contiguous, is_contiguous
 
-# Import from the nanobind module
-from ._cuda_impl import (
-    InterpolationType,  # type: ignore[attr-defined]
-    __nvcc_version__,  # type: ignore[attr-defined]  # noqa: F401
-)
-from ._cuda_impl import beamform as nb_beamform  # type: ignore[attr-defined]
+#: Name of the active backend, either "cuda" or "sycl".
+__backend__: str = _backend.BACKEND
+#: NVCC version string when the CUDA backend is active, otherwise None.
+__nvcc_version__: str | None = getattr(_backend.impl, "__nvcc_version__", None)
+#: DPC++ version string when the SYCL backend is active, otherwise None.
+__sycl_version__: str | None = getattr(_backend.impl, "__sycl_version__", None)
+
+#: Whole-sequence entry point, or None on backends that only beamform one transmit.
+nb_beamform_compound = getattr(_backend.impl, "beamform_compound", None)
+#: Whether `beamform_compound` is available on the active backend.
+SUPPORTS_COMPOUND: bool = nb_beamform_compound is not None
+
+#: Whether input arrays may carry a SYCL queue that mach's queue is not ordered against.
+_SYNC_DEVICE_QUEUES: bool = _backend.SHARES_DPCTL_CONTEXT
+
+
+def _sync_input_queues(*arrays: Any) -> None:
+    """Wait for pending dpnp/dpctl work on the inputs.
+
+    mach beamforms on its own in-order queue. Sharing dpctl's context makes its
+    arrays readable without a copy, but says nothing about ordering, so the work
+    that filled them has to finish before the kernel starts.
+    """
+    if not _SYNC_DEVICE_QUEUES:
+        return
+    for array in arrays:
+        queue = getattr(array, "sycl_queue", None)
+        if queue is not None:
+            queue.wait()
 
 # Export the InterpolationType enum for public use
-__all__ = ["InterpolationType", "beamform"]
+__all__ = ["SUPPORTS_COMPOUND", "InterpolationType", "beamform", "beamform_compound"]
 
 
 def beamform(  # noqa: C901
@@ -34,7 +61,7 @@ def beamform(  # noqa: C901
     tukey_alpha: float = 0.5,
     interp_type: InterpolationType = InterpolationType.Linear,
 ) -> Array:
-    """CUDA ultrasound beamforming with automatic GPU/CPU dispatch.
+    """GPU ultrasound beamforming with automatic GPU/CPU dispatch.
 
     This function implements delay-and-sum beamforming with the following features:
     - Dynamic aperture growth based on F-number
@@ -48,8 +75,11 @@ def beamform(  # noqa: C901
     Perrot et al., "So you think you can DAS? A viewpoint on delay-and-sum beamforming"
     https://www.biomecardio.com/publis/ultrasonics21.pdf
 
+    Runs on the compiled backend selected by `mach._backend`: CUDA on NVIDIA GPUs,
+    or SYCL/DPC++ on Intel GPUs and CPUs.
+
     `beamform` is a wrapper around `nb_beamform`, a nanobind-generated
-    Python/C++/CUDA function. `beamform` adds more helpful error-messages than `nb_beamform`,
+    Python/C++ function. `beamform` adds more helpful error-messages than `nb_beamform`,
     but it adds about 0.1ms overhead (on AMD Ryzen Threadripper Pro).
     If your inputs are properly shaped/typed, or you are okay reading nanobind's
     slightly-confusing type-check error messages, you can use `nb_beamform` directly.
@@ -59,7 +89,7 @@ def beamform(  # noqa: C901
             RF/IQ data with shape (n_rx, n_samples, n_frames).
             For I/Q data: use complex64 dtype.
             For RF data: use float32 dtype.
-            Note: this layout order improves memory-access patterns for the CUDA kernel.
+            Note: this layout order improves memory-access patterns for the GPU kernel.
         rx_coords_m:
             Receive element positions with shape (n_rx, 3) where each row is [x, y, z] in meters.
             Each element represents the physical location of a transducer element on the probe.
@@ -271,10 +301,119 @@ def beamform(  # noqa: C901
 
     assert modulation_freq_hz is not None
 
+    _sync_input_queues(channel_data, rx_coords_m, scan_coords_m, tx_wave_arrivals_s, out)
+
     # Nanobind's generated stub types these args as NumPy `ArrayLike`,
     # but we intentionally pass broader DLPack-compatible arrays (NumPy/CuPy/JAX/custom),
     # so we ignore the type error from nanobind's generated stub.
     nb_beamform(  # ty: ignore[no-matching-overload]
+        channel_data=channel_data,
+        rx_coords_m=rx_coords_m,
+        scan_coords_m=scan_coords_m,
+        tx_wave_arrivals_s=tx_wave_arrivals_s,
+        out=out,
+        f_number=f_number,
+        rx_start_s=rx_start_s,
+        sampling_freq_hz=sampling_freq_hz,
+        sound_speed_m_s=sound_speed_m_s,
+        modulation_freq_hz=modulation_freq_hz,
+        tukey_alpha=tukey_alpha,
+        interp_type=interp_type,
+    )
+
+    return cast(Array, out)
+
+
+def beamform_compound(
+    channel_data: Num[Array, "n_transmits n_rx n_samples n_frames"],
+    rx_coords_m: Real[Array, "n_rx xyz=3"],
+    scan_coords_m: Real[Array, "n_scan xyz=3"],
+    tx_wave_arrivals_s: Real[Array, "n_transmits n_scan"],
+    out: Num[Array, "n_scan n_frames"] | None = None,
+    *,
+    rx_start_s: float,
+    sampling_freq_hz: float,
+    f_number: float,
+    sound_speed_m_s: float,
+    modulation_freq_hz: float | None = None,
+    tukey_alpha: float = 0.5,
+    interp_type: InterpolationType = InterpolationType.Linear,
+) -> Array:
+    """Beamform a whole transmit sequence and coherently compound it in a single call.
+
+    Equivalent to calling `beamform` once per transmit and summing the results, but
+    the probe geometry, the scan grid and the arrival times cross the bus once for
+    the sequence instead of once per transmit, the accumulator stays in device
+    memory throughout, and there is one host/device synchronization instead of one
+    per transmit. Only `channel_data` is transferred per transmit.
+
+    Not every backend provides this; check `SUPPORTS_COMPOUND` before calling.
+
+    Args:
+        channel_data:
+            RF/IQ data with shape (n_transmits, n_rx, n_samples, n_frames), i.e. the
+            shape `beamform` takes with a leading transmit axis.
+        tx_wave_arrivals_s:
+            Transmit wave arrival times with shape (n_transmits, n_scan), in seconds.
+        out:
+            Optional output array with shape (n_scan, n_frames). An array already on
+            the device is accumulated into; a host array is overwritten.
+
+    See `beamform` for the remaining arguments.
+
+    Returns:
+        Compounded data with shape (n_scan, n_frames). Will be `out` if provided,
+        otherwise a new array.
+
+    Raises:
+        NotImplementedError: if the active backend has no compound entry point.
+    """
+    if nb_beamform_compound is None:
+        raise NotImplementedError(
+            f"The {__backend__!r} backend has no compound entry point. "
+            "Beamform each transmit with mach.kernel.beamform and sum the results."
+        )
+
+    xp_data = array_namespace(channel_data)
+    xp_coords = array_namespace(rx_coords_m)
+    xp_grid = array_namespace(scan_coords_m)
+    xp_idt = array_namespace(tx_wave_arrivals_s)
+
+    n_scan = scan_coords_m.shape[0]
+    n_frames = channel_data.shape[3]
+
+    is_complex = (channel_data.dtype == xp_data.complex64) or (channel_data.dtype == xp_data.complex128)
+    if is_complex:
+        channel_data = xp_data.astype(channel_data, xp_data.complex64, copy=False)
+        output_dtype = xp_data.complex64
+        if modulation_freq_hz is None:
+            raise ValueError(
+                "modulation_freq_hz is required for complex phase-correction. set it to 0 if no demodulation was used."
+            )
+    else:
+        channel_data = xp_data.astype(channel_data, xp_data.float32, copy=False)
+        output_dtype = xp_data.float32
+        if modulation_freq_hz is None:
+            modulation_freq_hz = 0.0
+
+    channel_data = ensure_contiguous(channel_data)
+    rx_coords_m = ensure_contiguous(xp_coords.astype(rx_coords_m, xp_coords.float32, copy=False))
+    scan_coords_m = ensure_contiguous(xp_grid.astype(scan_coords_m, xp_grid.float32, copy=False))
+    tx_wave_arrivals_s = ensure_contiguous(xp_idt.astype(tx_wave_arrivals_s, xp_idt.float32, copy=False))
+
+    if out is None:
+        out = xp_data.zeros((n_scan, n_frames), dtype=output_dtype)
+    elif out.dtype != output_dtype:
+        raise ValueError(f"Output array dtype {out.dtype} doesn't match expected {output_dtype}")
+
+    if not is_writeable_array(out):
+        raise ValueError("Output array `out` is not writable. Try using cupy or pytorch for the output array.")
+    if not is_contiguous(cast(Array, out)):
+        raise ValueError("Output array `out` must be contiguous.")
+
+    _sync_input_queues(channel_data, rx_coords_m, scan_coords_m, tx_wave_arrivals_s, out)
+
+    nb_beamform_compound(
         channel_data=channel_data,
         rx_coords_m=rx_coords_m,
         scan_coords_m=scan_coords_m,

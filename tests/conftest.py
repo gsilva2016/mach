@@ -6,6 +6,7 @@ from typing import cast
 import pytest
 from pyuff_ustb import ChannelData, Scan, Uff
 
+from mach import _backend
 from mach.io.utils import cached_download
 
 HAS_NUMPY = False
@@ -30,6 +31,17 @@ with contextlib.suppress(ImportError):
     import cupy as cp
 
     HAS_CUPY = True
+
+
+# The array library that allocates on the active backend's device: CuPy for the
+# CUDA backend, dpnp for the SYCL one. mach resolves this itself, since for SYCL
+# it also depends on whether it managed to join dpnp's SYCL context.
+DEVICE_XP = _backend.device_namespace()
+HAS_DEVICE_XP = DEVICE_XP is not None
+
+#: dpnp when it is the device library in use, otherwise None.
+dpnp = DEVICE_XP if getattr(DEVICE_XP, "__name__", "") == "dpnp" else None
+HAS_DPNP = dpnp is not None
 
 
 def pytest_addoption(parser):
@@ -94,6 +106,13 @@ def output_dir(request) -> Path | None:
     params=[
         pytest.param(np, id="numpy", marks=pytest.mark.skipif(not HAS_NUMPY, reason="NumPy not available")),
         pytest.param(cp, id="cupy", marks=pytest.mark.skipif(not HAS_CUPY, reason="CuPy not available")),
+        pytest.param(
+            dpnp,
+            id="dpnp",
+            marks=pytest.mark.skipif(
+                not HAS_DPNP, reason="dpnp not available, or mach is not sharing its SYCL context"
+            ),
+        ),
         # We need both JAX and CuPy to test JAX, because the `out` array must be writeable (JAX does not support this)
         pytest.param(
             jnp, id="jax", marks=pytest.mark.skipif(not (HAS_JAX and HAS_CUPY), reason="JAX or CuPy not available")
@@ -103,6 +122,18 @@ def output_dir(request) -> Path | None:
 def xp(request):
     """Fixture providing different array API backends."""
     return request.param
+
+
+@pytest.fixture
+def device_xp():
+    """The array library that allocates on the active backend's device.
+
+    CuPy under the CUDA backend, dpnp under the SYCL one, so that a test wanting
+    device-resident inputs does not have to care which backend mach was built with.
+    """
+    if DEVICE_XP is None:
+        pytest.skip("no device-array library for the active mach backend (needs CuPy or dpnp)")
+    return DEVICE_XP
 
 
 # Data fixtures

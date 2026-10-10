@@ -21,16 +21,11 @@ from einops import rearrange
 pytest.importorskip("pymust")
 import pymust
 
-try:
-    import cupy as cp
-
-    HAS_CUPY = True
-except ImportError:
-    HAS_CUPY = False
-    cp = None
-
 from mach import geometry, wavefront
 from mach.kernel import nb_beamform
+
+# Device arrays come from the `device_xp` fixture: CuPy under the CUDA backend,
+# dpnp under the SYCL one. The fixture skips when neither is usable.
 
 
 @pytest.fixture(scope="session")
@@ -102,7 +97,6 @@ def base_scaling_data(pymust_iq_data, pymust_element_positions, pymust_params):
     warmup=True,
     warmup_iterations=1,
 )
-@pytest.mark.skipif(not HAS_CUPY, reason="CuPy not available")
 @pytest.mark.parametrize(
     "grid_resolution",
     [
@@ -112,7 +106,7 @@ def base_scaling_data(pymust_iq_data, pymust_element_positions, pymust_params):
         pytest.param(1e-5, id="res_1e-5"),
     ],
 )
-def test_scaling_voxels(benchmark, base_scaling_data, grid_resolution):
+def test_scaling_voxels(benchmark, device_xp, base_scaling_data, grid_resolution):
     """Test performance scaling with number of voxels (grid resolution)."""
 
     data = base_scaling_data
@@ -150,14 +144,14 @@ def test_scaling_voxels(benchmark, base_scaling_data, grid_resolution):
     )
 
     # Transfer to GPU
-    iq_data_gpu = cp.asarray(data["iq_data"])
-    element_positions_gpu = cp.asarray(data["element_positions"])
-    scan_coords_gpu = cp.asarray(grid_points, dtype=cp.float32)
-    transmit_arrivals_gpu = cp.asarray(transmit_arrivals_s.flatten(), dtype=cp.float32)
+    iq_data_gpu = device_xp.asarray(data["iq_data"])
+    element_positions_gpu = device_xp.asarray(data["element_positions"])
+    scan_coords_gpu = device_xp.asarray(grid_points, dtype=device_xp.float32)
+    transmit_arrivals_gpu = device_xp.asarray(transmit_arrivals_s.flatten(), dtype=device_xp.float32)
 
     n_scan = scan_coords_gpu.shape[0]
     n_frames = iq_data_gpu.shape[2]
-    out = cp.empty((n_scan, n_frames), dtype=cp.complex64)
+    out = device_xp.empty((n_scan, n_frames), dtype=device_xp.complex64)
 
     def mach_voxel_scaling():
         """mach GPU function for voxel scaling benchmark."""
@@ -183,7 +177,7 @@ def test_scaling_voxels(benchmark, base_scaling_data, grid_resolution):
     # Verify basic properties (use the output array, not benchmark return value)
     expected_shape = (n_scan, n_frames)
     assert out.shape == expected_shape
-    assert np.isfinite(cp.asnumpy(out)).all()
+    assert np.isfinite(device_xp.asnumpy(out)).all()
 
 
 @pytest.mark.benchmark(
@@ -194,7 +188,6 @@ def test_scaling_voxels(benchmark, base_scaling_data, grid_resolution):
     warmup=True,
     warmup_iterations=1,
 )
-@pytest.mark.skipif(not HAS_CUPY, reason="CuPy not available")
 @pytest.mark.parametrize(
     "element_multiplier",
     [
@@ -207,7 +200,7 @@ def test_scaling_voxels(benchmark, base_scaling_data, grid_resolution):
         pytest.param(64, id="64x_elements"),
     ],
 )
-def test_scaling_receive_elements(benchmark, base_scaling_data, element_multiplier):
+def test_scaling_receive_elements(benchmark, device_xp, base_scaling_data, element_multiplier):
     """Test performance scaling with number of receive elements."""
 
     data = base_scaling_data
@@ -231,14 +224,14 @@ def test_scaling_receive_elements(benchmark, base_scaling_data, element_multipli
         # Keep identical positions - no offset needed
 
     # Transfer to GPU
-    iq_data_gpu = cp.asarray(scaled_iq)
-    element_positions_gpu = cp.asarray(scaled_positions)
-    scan_coords_gpu = cp.asarray(data["scan_coords_m"])
-    transmit_arrivals_gpu = cp.asarray(data["transmit_arrivals_s"])
+    iq_data_gpu = device_xp.asarray(scaled_iq)
+    element_positions_gpu = device_xp.asarray(scaled_positions)
+    scan_coords_gpu = device_xp.asarray(data["scan_coords_m"])
+    transmit_arrivals_gpu = device_xp.asarray(data["transmit_arrivals_s"])
 
     n_scan = scan_coords_gpu.shape[0]
     n_frames = iq_data_gpu.shape[2]
-    out = cp.empty((n_scan, n_frames), dtype=cp.complex64)
+    out = device_xp.empty((n_scan, n_frames), dtype=device_xp.complex64)
 
     def mach_element_scaling():
         """mach GPU function for element scaling benchmark."""
@@ -264,7 +257,7 @@ def test_scaling_receive_elements(benchmark, base_scaling_data, element_multipli
     # Verify basic properties (use the output array, not benchmark return value)
     expected_shape = (n_scan, n_frames)
     assert out.shape == expected_shape
-    assert np.isfinite(cp.asnumpy(out)).all()
+    assert np.isfinite(device_xp.asnumpy(out)).all()
 
 
 @pytest.mark.benchmark(
@@ -275,7 +268,6 @@ def test_scaling_receive_elements(benchmark, base_scaling_data, element_multipli
     warmup=True,
     warmup_iterations=1,
 )
-@pytest.mark.skipif(not HAS_CUPY, reason="CuPy not available")
 @pytest.mark.parametrize(
     "frame_multiplier",
     [
@@ -291,7 +283,7 @@ def test_scaling_receive_elements(benchmark, base_scaling_data, element_multipli
         pytest.param(16, id="16x_frames (512 frames)"),
     ],
 )
-def test_scaling_ensemble_size(benchmark, base_scaling_data, frame_multiplier):
+def test_scaling_ensemble_size(benchmark, device_xp, base_scaling_data, frame_multiplier):
     """Test performance scaling with ensemble size (number of frames)."""
 
     data = base_scaling_data
@@ -306,14 +298,14 @@ def test_scaling_ensemble_size(benchmark, base_scaling_data, frame_multiplier):
         scaled_iq = np.tile(original_iq, (1, 1, frame_multiplier))
 
     # Transfer to GPU
-    iq_data_gpu = cp.asarray(scaled_iq)
-    element_positions_gpu = cp.asarray(data["element_positions"])
-    scan_coords_gpu = cp.asarray(data["scan_coords_m"])
-    transmit_arrivals_gpu = cp.asarray(data["transmit_arrivals_s"])
+    iq_data_gpu = device_xp.asarray(scaled_iq)
+    element_positions_gpu = device_xp.asarray(data["element_positions"])
+    scan_coords_gpu = device_xp.asarray(data["scan_coords_m"])
+    transmit_arrivals_gpu = device_xp.asarray(data["transmit_arrivals_s"])
 
     n_scan = scan_coords_gpu.shape[0]
     n_frames = iq_data_gpu.shape[2]
-    out = cp.empty((n_scan, n_frames), dtype=cp.complex64)
+    out = device_xp.empty((n_scan, n_frames), dtype=device_xp.complex64)
 
     def mach_frame_scaling():
         """mach GPU function for frame scaling benchmark."""
@@ -339,4 +331,4 @@ def test_scaling_ensemble_size(benchmark, base_scaling_data, frame_multiplier):
     # Verify basic properties (use the output array, not benchmark return value)
     expected_shape = (n_scan, n_frames)
     assert out.shape == expected_shape
-    assert np.isfinite(cp.asnumpy(out)).all()
+    assert np.isfinite(device_xp.asnumpy(out)).all()

@@ -349,6 +349,19 @@ static __device__ __forceinline__ float tukey_apod_weight(float r_norm, float al
 }
 
 /**
+ * @brief Emit a Python warning, propagating it when filters escalate it to an error.
+ *
+ * PyErr_WarnEx leaves a Python exception set when it returns -1 (e.g. under
+ * `-W error`). Carrying on from there makes the next unrelated CPython call
+ * fail with an opaque SystemError.
+ */
+static void warn_or_throw(PyObject* category, const char* message) {
+    if (PyErr_WarnEx(category, message, 1) < 0) {
+        throw nb::python_error();
+    }
+}
+
+/**
  * @brief Check CUDA driver compatibility and warn if incompatible
  *
  * This function checks if the installed CUDA driver is compatible with the
@@ -359,7 +372,7 @@ static void checkCudaDriverCompatibility() {
 
     // Get driver version - if this fails, let later CUDA operations handle the error
     if (cudaDriverGetVersion(&driverVersion) != cudaSuccess) {
-        PyErr_WarnEx(PyExc_RuntimeWarning, "Could not get CUDA driver version", 1);
+        warn_or_throw(PyExc_RuntimeWarning, "Could not get CUDA driver version");
         return;
     }
 
@@ -384,7 +397,7 @@ static void checkCudaDriverCompatibility() {
         "→ Please update your NVIDIA driver to version " +
         std::to_string(nvccMajor) + "." + std::to_string(nvccMinor) + " or newer.";
 
-    PyErr_WarnEx(PyExc_RuntimeWarning, warning_msg.c_str(), 1);
+    warn_or_throw(PyExc_RuntimeWarning, warning_msg.c_str());
 }
 
 /**
@@ -418,7 +431,7 @@ static void checkComputeCapability() {
             std::to_string(MIN_CC_MAJOR) + "." + std::to_string(MIN_CC_MINOR) +
             ". Kernels may fail to load.";
 
-        PyErr_WarnEx(PyExc_RuntimeWarning, warning_msg.c_str(), 1);
+        warn_or_throw(PyExc_RuntimeWarning, warning_msg.c_str());
     }
 }
 
@@ -1088,16 +1101,12 @@ void beamform(
     }
 
     // Use PyErr_WarnEx directly instead of Python warnings module
-    // This is more reliable across different binding libraries
+    // This is more reliable across different binding libraries.
+    // warn_or_throw respects Python's warning filter configuration (e.g., -W error).
     std::string warning_msg = "Found " + std::to_string(cpu_count) + " input array(s) on CPU. " +
                               "This will add latency due to CPU<->GPU memory transfers. " +
                               "For optimal performance with CUDA beamforming, move arrays to GPU using cupy, jax, or similar.";
-    if (PyErr_WarnEx(PyExc_UserWarning, warning_msg.c_str(), 1) < 0) {
-        // Warning was converted to exception by warning filters - let it propagate
-        // This respects Python's warning filter configuration (e.g., -W error)
-        // https://docs.python.org/3/c-api/exceptions.html
-        return;
-    }
+    warn_or_throw(PyExc_UserWarning, warning_msg.c_str());
 
     // RAII-safe GPU device memory allocation for arrays that start on CPU
     // These unique_ptrs automatically call cudaFree when they go out of scope

@@ -21,14 +21,6 @@ pytest.importorskip("pymust")
 import pymust
 
 try:
-    import cupy as cp
-
-    HAS_CUPY = True
-except ImportError:
-    HAS_CUPY = False
-    cp = None
-
-try:
     import jax
     from jax.experimental import sparse as jax_experimental_sparse
 
@@ -38,9 +30,15 @@ except ImportError:
     jax_experimental_sparse = None
     HAS_JAX = False
 
-from mach import geometry, wavefront
+from mach import _backend, geometry, wavefront
 from mach._vis import save_debug_figures
 from mach.kernel import beamform, nb_beamform
+
+# Device arrays come from whichever library matches the active backend: CuPy
+# under CUDA, dpnp under SYCL. PyMUST itself is NumPy-based, so the comparison
+# is meaningful on either.
+DEVICE_XP = _backend.device_namespace()
+HAS_DEVICE_XP = DEVICE_XP is not None
 
 # ============================================================================
 # Fixtures
@@ -121,22 +119,14 @@ def benchmark_data(pymust_iq_data, pymust_element_positions, pymust_meshgrid, tr
 
     # GPU data (if available)
     gpu_data = {}
-    if HAS_CUPY:
-        iq_data_gpu = cp.zeros_like(iq_data_reordered)
-        cp.cuda.runtime.memcpy(
-            iq_data_gpu.data.ptr,
-            iq_data_reordered.ctypes.data,
-            iq_data_reordered.nbytes,
-            cp.cuda.runtime.memcpyHostToDevice,
-        )
-
+    if HAS_DEVICE_XP:
         gpu_data.update({
-            "iq_data_gpu": iq_data_gpu,
-            "element_positions_gpu": cp.asarray(pymust_element_positions, dtype=cp.float32),
-            "scan_coords_m_gpu": cp.asarray(
-                np.stack([x_grid.flat, y_grid.flat, z_grid.flat], axis=-1), dtype=cp.float32
+            "iq_data_gpu": DEVICE_XP.asarray(iq_data_reordered),
+            "element_positions_gpu": DEVICE_XP.asarray(pymust_element_positions, dtype=DEVICE_XP.float32),
+            "scan_coords_m_gpu": DEVICE_XP.asarray(
+                np.stack([x_grid.flat, y_grid.flat, z_grid.flat], axis=-1), dtype=DEVICE_XP.float32
             ),
-            "transmit_arrivals_s_gpu": cp.asarray(transmit_arrivals_s.flatten(), dtype=cp.float32),
+            "transmit_arrivals_s_gpu": DEVICE_XP.asarray(transmit_arrivals_s.flatten(), dtype=DEVICE_XP.float32),
         })
 
     return {
@@ -211,7 +201,9 @@ def test_pymust_benchmark(
 
     USE_JAX_SPARSE = HAS_JAX and (sparse_backend == jax_experimental_sparse.BCOO.from_scipy_sparse)
     if USE_JAX_SPARSE:
-        device = jax.devices("gpu")[0]
+        # The default backend, rather than "gpu": jax.devices() raises for a platform it
+        # was not built with, and jax[cpu] is a fine host for the sparse comparison.
+        device = jax.devices()[0]
         M = jax_experimental_sparse.BCOO.from_scipy_sparse(M)
         M = jax.device_put(M, device)
         flattened_data = jax.device_put(flattened_data, device)
@@ -253,7 +245,7 @@ def test_pymust_benchmark(
     warmup=True,
     warmup_iterations=1,
 )
-@pytest.mark.skipif(not HAS_CUPY, reason="CuPy not available")
+@pytest.mark.skipif(not HAS_DEVICE_XP, reason="no device-array library for the active mach backend")
 def test_mach(benchmark, benchmark_data, pymust_das_matrix, output_dir):
     """
     Unified test: mach GPU implementation.
@@ -272,7 +264,7 @@ def test_mach(benchmark, benchmark_data, pymust_das_matrix, output_dir):
 
     n_scan = data["scan_coords_m_gpu"].shape[0]
     n_frames = data["iq_data_gpu"].shape[2]
-    out = cp.empty((n_scan, n_frames), dtype=cp.complex64)
+    out = DEVICE_XP.empty((n_scan, n_frames), dtype=DEVICE_XP.complex64)
 
     def mach_gpu():
         """mach GPU function to benchmark."""
@@ -301,7 +293,7 @@ def test_mach(benchmark, benchmark_data, pymust_das_matrix, output_dir):
     expected_shape = (data["scan_coords_m_gpu"].shape[0], data["iq_data_gpu"].shape[2])
     assert gpu_result.shape == expected_shape
 
-    gpu_result_cpu = cp.asnumpy(gpu_result)
+    gpu_result_cpu = DEVICE_XP.asnumpy(gpu_result)
     assert np.isfinite(gpu_result_cpu).all()
 
     # For correctness comparison, run PyMUST reference (not benchmarked)

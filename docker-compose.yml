@@ -24,3 +24,42 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+
+  # SYCL backend on an Intel GPU, through Level Zero
+  # Needs /dev/dri from the host and a matching Intel GPU driver on it
+  sycl-gpu:
+    build:
+      context: .
+      dockerfile: Dockerfile.sycl
+      args:
+        DEVICE: gpu
+    image: mach-beamform-sycl:gpu
+    stdin_open: true
+    tty: true
+    working_dir: /workspace
+
+    volumes:
+      - .:/workspace
+      - /workspace/.venv      # Anonymous volume masks .venv from host
+      - /workspace/build      # Anonymous volume masks build from host
+
+    devices:
+      - /dev/dri:/dev/dri
+
+  # SYCL backend on the CPU, through the OpenCL runtime
+  # No Intel GPU driver stack and no device passthrough, so this runs anywhere
+  sycl-cpu:
+    build:
+      context: .
+      dockerfile: Dockerfile.sycl
+      args:
+        DEVICE: cpu
+    image: mach-beamform-sycl:cpu
+    stdin_open: true
+    tty: true
+    working_dir: /workspace
+
+    volumes:
+      - .:/workspace
+      - /workspace/.venv      # Anonymous volume masks .venv from host
+      - /workspace/build      # Anonymous volume masks build from host

@@ -15,6 +15,7 @@ class DLPackDevice(int, Enum):
 
     CPU = 1
     CUDA = 2
+    ONEAPI = 14
 
 
 @runtime_checkable

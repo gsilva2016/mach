@@ -3,6 +3,7 @@
 *.so
 *.png
 *.cpp
+!src/mach/kernel_sycl.cpp
 build
 
 # uv

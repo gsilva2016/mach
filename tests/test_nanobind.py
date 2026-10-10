@@ -4,7 +4,7 @@ from typing import Any
 
 import numpy as np
 import pytest
-from array_api_compat import is_cupy_namespace, is_jax_namespace, is_numpy_namespace
+from array_api_compat import is_jax_namespace, is_numpy_namespace
 
 import mach
 from mach._array_api import array_namespace
@@ -20,15 +20,7 @@ def create_test_data(xp: Any) -> tuple[Any, Any, Any, Any, Any, int, int, int, i
     n_scan_points = 8
 
     # Create RF data (shape: n_receive_elements, n_samples, n_frames)
-    if is_numpy_namespace(xp) or is_cupy_namespace(xp):
-        rf = xp.random.normal(size=(n_receive_elements, n_samples, n_frames)).astype(xp.float32)
-        rf_complex = (
-            rf + 1j * xp.random.normal(size=(n_receive_elements, n_samples, n_frames)).astype(xp.float32, copy=False)
-        ).astype(xp.complex64, copy=False)
-        coords = xp.random.normal(size=(n_receive_elements, 3)).astype(xp.float32)
-        grid = xp.random.normal(size=(n_scan_points, 3)).astype(xp.float32)
-        idt_matrix = xp.zeros(n_scan_points).astype(xp.float32)
-    elif is_jax_namespace(xp):
+    if is_jax_namespace(xp):
         import jax
 
         rf = jax.random.normal(key=jax.random.PRNGKey(0), shape=(n_receive_elements, n_samples, n_frames)).astype(
@@ -45,7 +37,14 @@ def create_test_data(xp: Any) -> tuple[Any, Any, Any, Any, Any, int, int, int, i
         grid = jax.random.normal(key=jax.random.PRNGKey(3), shape=(n_scan_points, 3)).astype(xp.float32)
         idt_matrix = xp.zeros(n_scan_points).astype(xp.float32)
     else:
-        raise ValueError(f"Unsupported array library: {xp}")
+        # numpy, cupy and dpnp all keep the legacy xp.random API
+        rf = xp.random.normal(size=(n_receive_elements, n_samples, n_frames)).astype(xp.float32)
+        rf_complex = (
+            rf + 1j * xp.random.normal(size=(n_receive_elements, n_samples, n_frames)).astype(xp.float32, copy=False)
+        ).astype(xp.complex64, copy=False)
+        coords = xp.random.normal(size=(n_receive_elements, 3)).astype(xp.float32)
+        grid = xp.random.normal(size=(n_scan_points, 3)).astype(xp.float32)
+        idt_matrix = xp.zeros(n_scan_points).astype(xp.float32)
 
     return rf, rf_complex, coords, grid, idt_matrix, n_frames, n_receive_elements, n_samples, n_scan_points
 
@@ -176,12 +175,8 @@ def test_beamform_mixed_cpu_gpu_arrays(xp, test_data):
     # Data should already be on the GPU
     # Try moving one of the inputs to the CPU to check that it works
     # just with a warning
-    if is_cupy_namespace(xp):
-        import cupy as cp
-
-        grid = cp.asnumpy(grid)
-    else:
-        grid = np.array(grid)
+    # cupy and dpnp both spell host transfer the same way
+    grid = xp.asnumpy(grid) if hasattr(xp, "asnumpy") else np.array(grid)
 
     with pytest.warns(UserWarning, match=".*latency.*"):
         output = beamform(

@@ -19,9 +19,9 @@ def test_array_protocol(xp):
     elif is_jax_namespace(xp):
         import jax
 
-        if jax.devices("gpu"):
-            assert device_type == DLPackDevice.CUDA
-        else:
-            assert device_type == DLPackDevice.CPU
+        # arr lives on jax's default backend, so that is what decides the DLPack device.
+        # Asking jax.devices("gpu") instead would raise on a jax[cpu] install.
+        jax_platforms = {"cuda": DLPackDevice.CUDA, "gpu": DLPackDevice.CUDA, "oneapi": DLPackDevice.ONEAPI}
+        assert device_type == jax_platforms.get(jax.default_backend(), DLPackDevice.CPU)
     elif is_cupy_namespace(xp):
         assert device_type == DLPackDevice.CUDA
